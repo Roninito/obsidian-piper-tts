@@ -6,6 +6,10 @@ export function stripMarkdown(text: string): string {
 return text
 // Remove frontmatter
 .replace(/^---[\s\S]*?---\n?/, '')
+// Remove Obsidian image/audio embeds ![[file]] BEFORE wiki-link handling
+.replace(/!\[\[[^\]]*\]\]/g, '')
+// Remove markdown images ![alt](url)
+.replace(/!\[[^\]]*\]\([^)]*\)/g, '')
 // Remove headings
 .replace(/^#{1,6}\s+/gm, '')
 // Remove bold/italic
@@ -13,13 +17,11 @@ return text
 // Remove inline code
 .replace(/`[^`]+`/g, '')
 // Remove code blocks
-.replace(/```[\s\S]*?```/g, '')
+.replace(/```[\s\S]*?```/gs, '')
 // Remove links — keep display text
 .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
 // Remove wiki links — keep display text
 .replace(/\[\[([^\]|]+)\|?([^\]]*)\]\]/g, (_, target, alias) => alias || target)
-// Remove images
-.replace(/!\[[^\]]*\]\([^)]*\)/g, '')
 // Remove horizontal rules
 .replace(/^---+$/gm, '')
 // Remove blockquote markers
@@ -40,7 +42,7 @@ return text
 export function chunkText(text: string, maxChars = 500): string[] {
 if (!text.trim()) return [];
 
-// Split on sentence-ending punctuation followed by whitespace
+// Split on sentence-ending punctuation followed by whitespace or end
 const sentences = text.match(/[^.!?]+[.!?]+(\s|$)|[^.!?]+$/g) ?? [text];
 const chunks: string[] = [];
 let current = '';
