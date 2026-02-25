@@ -1,99 +1,207 @@
-import {App, Editor, MarkdownView, Modal, Notice, Plugin} from 'obsidian';
-import {DEFAULT_SETTINGS, MyPluginSettings, SampleSettingTab} from "./settings";
+import { Plugin, MarkdownView, Notice, Editor } from 'obsidian';
+import { PiperEngine } from './piper-engine';
+import { AudioPlayer } from './audio-player';
+import { StatusBarWidget } from './ui/status-bar';
+import { PiperSettingsTab, DEFAULT_SETTINGS, type PiperSettings } from './settings';
+import { stripMarkdown, chunkText } from './text-chunker';
 
-// Remember to rename these classes and interfaces!
+export default class PiperTTSPlugin extends Plugin {
+  settings!: PiperSettings;
+  piperEngine!: PiperEngine;
+  audioPlayer!: AudioPlayer;
+  private statusBar!: StatusBarWidget;
+  private isSynthesizing = false;
 
-export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
+  async onload() {
+    await this.loadSettings();
 
-	async onload() {
-		await this.loadSettings();
+    this.piperEngine = new PiperEngine(
+      this.settings.piperBinaryPath,
+      this.settings.modelsDir,
+    );
 
-		// This creates an icon in the left ribbon.
-		this.addRibbonIcon('dice', 'Sample', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
+    this.audioPlayer = new AudioPlayer();
+    this.audioPlayer.setOnStateChange((state, chunkInfo) => {
+      this.statusBar?.update(state, chunkInfo);
+    });
+    this.audioPlayer.setOnChunkEnd((filePath) => {
+      this.piperEngine.cleanupFile(filePath);
+    });
 
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status bar text');
+    // Status bar
+    const statusEl = this.addStatusBarItem();
+    this.statusBar = new StatusBarWidget(statusEl);
+    this.statusBar.setClickHandler(() => this.audioPlayer.togglePause());
 
-		// This adds a simple command that can be triggered anywhere
-		this.addCommand({
-			id: 'open-modal-simple',
-			name: 'Open modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
-			}
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'replace-selected',
-			name: 'Replace selected content',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				editor.replaceSelection('Sample editor command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-modal-complex',
-			name: 'Open modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
+    // Ribbon icon
+    this.addRibbonIcon('volume-2', 'Read current note (Piper TTS)', () => {
+      if (this.audioPlayer.isActive()) {
+        this.audioPlayer.stop();
+      } else {
+        this.readCurrentNote();
+      }
+    });
 
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
-				}
-				return false;
-			}
-		});
+    // Commands
+    this.addCommand({
+      id: 'read-selection',
+      name: 'Read selected text',
+      editorCallback: (editor: Editor) => {
+        const text = editor.getSelection();
+        if (text.trim()) this.speak(text);
+        else new Notice('No text selected.');
+      },
+    });
 
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
+    this.addCommand({
+      id: 'read-note',
+      name: 'Read entire note',
+      callback: () => this.readCurrentNote(),
+    });
 
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			new Notice("Click");
-		});
+    this.addCommand({
+      id: 'toggle-pause',
+      name: 'Pause / Resume',
+      callback: () => this.audioPlayer.togglePause(),
+    });
 
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
+    this.addCommand({
+      id: 'stop-reading',
+      name: 'Stop reading',
+      callback: () => {
+        this.audioPlayer.stop();
+        this.isSynthesizing = false;
+      },
+    });
 
-	}
+    this.addCommand({
+      id: 'export-audio',
+      name: 'Export note as WAV',
+      callback: () => this.exportNoteAsAudio(),
+    });
 
-	onunload() {
-	}
+    this.addCommand({
+      id: 'browse-voices',
+      name: 'Browse & download voices',
+      callback: () => {
+        const { VoiceBrowserModal } = require('./ui/voice-browser-modal');
+        new VoiceBrowserModal(this.app, this).open();
+      },
+    });
 
-	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as Partial<MyPluginSettings>);
-	}
+    this.addSettingTab(new PiperSettingsTab(this.app, this));
 
-	async saveSettings() {
-		await this.saveData(this.settings);
-	}
-}
+    console.log('[PiperTTS] Plugin loaded.');
+  }
 
-class SampleModal extends Modal {
-	constructor(app: App) {
-		super(app);
-	}
+  onunload() {
+    this.audioPlayer.stop();
+    this.piperEngine.cleanupAll();
+    console.log('[PiperTTS] Plugin unloaded.');
+  }
 
-	onOpen() {
-		let {contentEl} = this;
-		contentEl.setText('Woah!');
-	}
+  async speak(rawText: string): Promise<void> {
+    if (!this.settings.voiceModel) {
+      new Notice('⚠️ No voice selected. Open Settings > Piper TTS to choose a voice.');
+      return;
+    }
 
-	onClose() {
-		const {contentEl} = this;
-		contentEl.empty();
-	}
+    const text = this.settings.stripMarkdown ? stripMarkdown(rawText) : rawText;
+    if (!text.trim()) {
+      new Notice('Nothing to read after stripping markdown.');
+      return;
+    }
+
+    const chunks = chunkText(text, this.settings.chunkSize);
+    if (chunks.length === 0) return;
+
+    this.audioPlayer.stop();
+    this.isSynthesizing = true;
+    this.statusBar.update('loading');
+
+    const filePaths: string[] = [];
+
+    try {
+      // Synthesize all chunks (could parallelize, but serial keeps memory low for large notes)
+      for (const chunk of chunks) {
+        if (!this.isSynthesizing) break;
+        const path = await this.piperEngine.synthesize(chunk, this.settings.voiceModel, this.settings.speed);
+        filePaths.push(path);
+      }
+
+      if (!this.isSynthesizing) {
+        for (const p of filePaths) this.piperEngine.cleanupFile(p);
+        return;
+      }
+
+      await this.audioPlayer.playQueue(filePaths, this.settings.speed);
+    } catch (e) {
+      new Notice(`❌ TTS error: ${e instanceof Error ? e.message : String(e)}`);
+      this.statusBar.update('idle');
+      for (const p of filePaths) this.piperEngine.cleanupFile(p);
+    } finally {
+      this.isSynthesizing = false;
+    }
+  }
+
+  private async readCurrentNote(): Promise<void> {
+    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    if (!view) {
+      new Notice('No active note.');
+      return;
+    }
+    const text = view.getViewData();
+    await this.speak(text);
+  }
+
+  private async exportNoteAsAudio(): Promise<void> {
+    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    if (!view) {
+      new Notice('No active note.');
+      return;
+    }
+    if (!this.settings.voiceModel) {
+      new Notice('⚠️ No voice selected.');
+      return;
+    }
+
+    const rawText = view.getViewData();
+    const text = this.settings.stripMarkdown ? stripMarkdown(rawText) : rawText;
+    const chunks = chunkText(text, this.settings.chunkSize);
+    if (chunks.length === 0) {
+      new Notice('Nothing to export.');
+      return;
+    }
+
+    new Notice('⏳ Exporting audio…');
+
+    try {
+      // For export, synthesize each chunk and write to vault
+      const { join } = require('path');
+      const { writeFileSync, readFileSync, unlinkSync } = require('fs');
+      const fileName = `${view.file?.basename ?? 'export'}.wav`;
+      const adapter = this.app.vault.adapter as any;
+      const destPath = join(adapter.getBasePath(), fileName);
+
+      // Single chunk export for simplicity; multi-chunk would need WAV concat
+      const allText = chunks.join(' ');
+      const tmpPath = await this.piperEngine.synthesize(allText, this.settings.voiceModel, this.settings.speed);
+      writeFileSync(destPath, readFileSync(tmpPath));
+      this.piperEngine.cleanupFile(tmpPath);
+
+      new Notice(`✅ Exported to vault: ${fileName}`);
+    } catch (e) {
+      new Notice(`❌ Export failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  async loadSettings() {
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+  }
+
+  async saveSettings() {
+    await this.saveData(this.settings);
+    // Propagate path changes to engine
+    this.piperEngine?.updatePaths(this.settings.piperBinaryPath, this.settings.modelsDir);
+  }
 }
