@@ -25,24 +25,22 @@ export default class PiperTTSPlugin extends Plugin {
       this.statusBar?.update(state, chunkInfo);
     });
     this.audioPlayer.setOnChunkEnd((filePath) => {
-      this.piperEngine.cleanupFile(filePath);
+      if (filePath) this.piperEngine.cleanupFile(filePath);
     });
 
-    // Status bar
     const statusEl = this.addStatusBarItem();
     this.statusBar = new StatusBarWidget(statusEl);
     this.statusBar.setClickHandler(() => this.audioPlayer.togglePause());
 
-    // Ribbon icon
     this.addRibbonIcon('volume-2', 'Read current note (Piper TTS)', () => {
       if (this.audioPlayer.isActive()) {
         this.audioPlayer.stop();
+        this.isSynthesizing = false;
       } else {
         this.readCurrentNote();
       }
     });
 
-    // Commands
     this.addCommand({
       id: 'read-selection',
       name: 'Read selected text',
@@ -90,11 +88,11 @@ export default class PiperTTSPlugin extends Plugin {
     });
 
     this.addSettingTab(new PiperSettingsTab(this.app, this));
-
     console.log('[PiperTTS] Plugin loaded.');
   }
 
   onunload() {
+    this.isSynthesizing = false;
     this.audioPlayer.stop();
     this.piperEngine.cleanupAll();
     console.log('[PiperTTS] Plugin unloaded.');
@@ -102,7 +100,7 @@ export default class PiperTTSPlugin extends Plugin {
 
   async speak(rawText: string): Promise<void> {
     if (!this.settings.voiceModel) {
-      new Notice('⚠️ No voice selected. Open Settings > Piper TTS to choose a voice.');
+      new Notice('⚠️ No voice selected. Open Settings → Piper TTS to choose a voice.');
       return;
     }
 
@@ -115,30 +113,40 @@ export default class PiperTTSPlugin extends Plugin {
     const chunks = chunkText(text, this.settings.chunkSize);
     if (chunks.length === 0) return;
 
+    // Stop any current playback
     this.audioPlayer.stop();
     this.isSynthesizing = true;
+
+    // Start streaming mode — audio will play as soon as first chunk is ready
+    this.audioPlayer.startStreaming(this.settings.speed);
     this.statusBar.update('loading');
 
-    const filePaths: string[] = [];
+    const synthesized: string[] = [];
 
     try {
-      // Synthesize all chunks (could parallelize, but serial keeps memory low for large notes)
-      for (const chunk of chunks) {
-        if (!this.isSynthesizing) break;
-        const path = await this.piperEngine.synthesize(chunk, this.settings.voiceModel, this.settings.speed);
-        filePaths.push(path);
-      }
+      for (let i = 0; i < chunks.length; i++) {
+        if (!this.isSynthesizing) {
+          // User stopped — clean up any already-synthesized files
+          for (const p of synthesized) this.piperEngine.cleanupFile(p);
+          return;
+        }
 
-      if (!this.isSynthesizing) {
-        for (const p of filePaths) this.piperEngine.cleanupFile(p);
-        return;
-      }
+        const filePath = await this.piperEngine.synthesize(
+          chunks[i] as string,
+          this.settings.voiceModel,
+          this.settings.speed,
+        );
+        synthesized.push(filePath);
 
-      await this.audioPlayer.playQueue(filePaths, this.settings.speed);
+        // Hand off to audio player — it starts playing immediately on first chunk
+        this.audioPlayer.addChunk(filePath, chunks.length);
+      }
     } catch (e) {
+      this.isSynthesizing = false;
+      this.audioPlayer.stop();
+      for (const p of synthesized) this.piperEngine.cleanupFile(p);
       new Notice(`❌ TTS error: ${e instanceof Error ? e.message : String(e)}`);
       this.statusBar.update('idle');
-      for (const p of filePaths) this.piperEngine.cleanupFile(p);
     } finally {
       this.isSynthesizing = false;
     }
@@ -150,46 +158,34 @@ export default class PiperTTSPlugin extends Plugin {
       new Notice('No active note.');
       return;
     }
-    const text = view.getViewData();
-    await this.speak(text);
+    await this.speak(view.getViewData());
   }
 
   private async exportNoteAsAudio(): Promise<void> {
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-    if (!view) {
-      new Notice('No active note.');
-      return;
-    }
-    if (!this.settings.voiceModel) {
-      new Notice('⚠️ No voice selected.');
-      return;
-    }
+    if (!view) { new Notice('No active note.'); return; }
+    if (!this.settings.voiceModel) { new Notice('⚠️ No voice selected.'); return; }
 
     const rawText = view.getViewData();
     const text = this.settings.stripMarkdown ? stripMarkdown(rawText) : rawText;
-    const chunks = chunkText(text, this.settings.chunkSize);
-    if (chunks.length === 0) {
-      new Notice('Nothing to export.');
-      return;
-    }
+    if (!text.trim()) { new Notice('Nothing to export.'); return; }
 
     new Notice('⏳ Exporting audio…');
 
     try {
-      // For export, synthesize each chunk and write to vault
       const { join } = require('path');
-      const { writeFileSync, readFileSync, unlinkSync } = require('fs');
+      const { writeFileSync, readFileSync } = require('fs');
       const fileName = `${view.file?.basename ?? 'export'}.wav`;
       const adapter = this.app.vault.adapter as any;
       const destPath = join(adapter.getBasePath(), fileName);
 
-      // Single chunk export for simplicity; multi-chunk would need WAV concat
-      const allText = chunks.join(' ');
+      // Synthesize as single block for export
+      const allText = chunkText(text, 5000).join(' ');
       const tmpPath = await this.piperEngine.synthesize(allText, this.settings.voiceModel, this.settings.speed);
       writeFileSync(destPath, readFileSync(tmpPath));
       this.piperEngine.cleanupFile(tmpPath);
 
-      new Notice(`✅ Exported to vault: ${fileName}`);
+      new Notice(`✅ Exported to vault root: ${fileName}`);
     } catch (e) {
       new Notice(`❌ Export failed: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -201,7 +197,6 @@ export default class PiperTTSPlugin extends Plugin {
 
   async saveSettings() {
     await this.saveData(this.settings);
-    // Propagate path changes to engine
     this.piperEngine?.updatePaths(this.settings.piperBinaryPath, this.settings.modelsDir);
   }
 }
