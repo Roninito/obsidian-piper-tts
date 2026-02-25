@@ -57,6 +57,22 @@ export default class PiperTTSPlugin extends Plugin {
       callback: () => this.readCurrentNote(),
     });
 
+    // Read from the cursor position to the end of the document
+    this.addCommand({
+      id: 'read-from-cursor',
+      name: 'Read from cursor to end',
+      editorCallback: (editor: Editor) => {
+        const cursor = editor.getCursor();
+        const lastLine = editor.lastLine();
+        const text = editor.getRange(cursor, {
+          line: lastLine,
+          ch: editor.getLine(lastLine).length,
+        });
+        if (text.trim()) this.speak(text);
+        else new Notice('Nothing to read from cursor position.');
+      },
+    });
+
     this.addCommand({
       id: 'toggle-pause',
       name: 'Pause / Resume',
@@ -113,11 +129,8 @@ export default class PiperTTSPlugin extends Plugin {
     const chunks = chunkText(text, this.settings.chunkSize);
     if (chunks.length === 0) return;
 
-    // Stop any current playback
     this.audioPlayer.stop();
     this.isSynthesizing = true;
-
-    // Start streaming mode — audio will play as soon as first chunk is ready
     this.audioPlayer.startStreaming(this.settings.speed);
     this.statusBar.update('loading');
 
@@ -126,7 +139,6 @@ export default class PiperTTSPlugin extends Plugin {
     try {
       for (let i = 0; i < chunks.length; i++) {
         if (!this.isSynthesizing) {
-          // User stopped — clean up any already-synthesized files
           for (const p of synthesized) this.piperEngine.cleanupFile(p);
           return;
         }
@@ -137,8 +149,6 @@ export default class PiperTTSPlugin extends Plugin {
           this.settings.speed,
         );
         synthesized.push(filePath);
-
-        // Hand off to audio player — it starts playing immediately on first chunk
         this.audioPlayer.addChunk(filePath, chunks.length);
       }
     } catch (e) {
@@ -152,34 +162,40 @@ export default class PiperTTSPlugin extends Plugin {
     }
   }
 
+  /**
+   * Read the full note by reading directly from the vault (not the view),
+   * so it always gets the complete raw markdown regardless of scroll position
+   * or view mode.
+   */
   private async readCurrentNote(): Promise<void> {
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-    if (!view) {
+    if (!view || !view.file) {
       new Notice('No active note.');
       return;
     }
-    await this.speak(view.getViewData());
+    // vault.read() gives the complete file content — never truncated
+    const text = await this.app.vault.read(view.file);
+    await this.speak(text);
   }
 
   private async exportNoteAsAudio(): Promise<void> {
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-    if (!view) { new Notice('No active note.'); return; }
+    if (!view || !view.file) { new Notice('No active note.'); return; }
     if (!this.settings.voiceModel) { new Notice('⚠️ No voice selected.'); return; }
-
-    const rawText = view.getViewData();
-    const text = this.settings.stripMarkdown ? stripMarkdown(rawText) : rawText;
-    if (!text.trim()) { new Notice('Nothing to export.'); return; }
 
     new Notice('⏳ Exporting audio…');
 
     try {
       const { join } = require('path');
       const { writeFileSync, readFileSync } = require('fs');
-      const fileName = `${view.file?.basename ?? 'export'}.wav`;
+      const rawText = await this.app.vault.read(view.file);
+      const text = this.settings.stripMarkdown ? stripMarkdown(rawText) : rawText;
+      if (!text.trim()) { new Notice('Nothing to export.'); return; }
+
+      const fileName = `${view.file.basename}.wav`;
       const adapter = this.app.vault.adapter as any;
       const destPath = join(adapter.getBasePath(), fileName);
 
-      // Synthesize as single block for export
       const allText = chunkText(text, 5000).join(' ');
       const tmpPath = await this.piperEngine.synthesize(allText, this.settings.voiceModel, this.settings.speed);
       writeFileSync(destPath, readFileSync(tmpPath));
