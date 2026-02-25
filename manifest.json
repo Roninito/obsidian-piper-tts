@@ -4,7 +4,7 @@
 "version": "1.0.0",
 "minAppVersion": "1.0.0",
 "description": "Text-to-speech for your notes using local Piper TTS engine with 200+ voices.",
-"author": "ronin",
-"authorUrl": "https://github.com/ronin",
+"author": "Roninito",
+"authorUrl": "https://github.com/Roninito",
 "isDesktopOnly": true
 }
